@@ -145,7 +145,20 @@ export type AgentSessionEvent =
 			errorMessage?: string;
 	  }
 	| { type: "auto_retry_start"; attempt: number; maxAttempts: number; delayMs: number; errorMessage: string }
-	| { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string };
+	| { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string }
+	| {
+			type: "session_message_persisted";
+			message: Message | CustomMessage | BashExecutionMessage;
+			entryId: string;
+			sessionFile?: string;
+	  }
+	| {
+			type: "agent_settled";
+			outcome: "complete" | "error" | "aborted";
+			retried: boolean;
+			compacted: boolean;
+			errorMessage?: string;
+	  };
 
 /** Listener function for agent session events */
 export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
@@ -282,6 +295,10 @@ export class AgentSession {
 	// Retry state
 	private _retryAbortController: AbortController | undefined = undefined;
 	private _retryAttempt = 0;
+
+	// Settlement tracking (Tau patch: agent_settled event)
+	private _settlementHadRetry = false;
+	private _settlementHadCompaction = false;
 
 	// Bash execution state
 	private _bashAbortController: AbortController | undefined = undefined;
@@ -521,7 +538,13 @@ export class AgentSession {
 				event.message.role === "toolResult"
 			) {
 				// Regular LLM message - persist as SessionMessageEntry
-				this.sessionManager.appendMessage(event.message);
+				const entryId = this.sessionManager.appendMessage(event.message);
+				this._emit({
+					type: "session_message_persisted",
+					message: event.message,
+					entryId,
+					sessionFile: this.sessionManager.getSessionFile(),
+				});
 			}
 			// Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
 
@@ -954,6 +977,7 @@ export class AgentSession {
 		}
 
 		if (this._isRetryableError(msg) && (await this._prepareRetry(msg))) {
+			this._settlementHadRetry = true;
 			return true;
 		}
 
@@ -968,12 +992,34 @@ export class AgentSession {
 		}
 
 		if (await this._checkCompaction(msg)) {
+			this._settlementHadCompaction = true;
 			return true;
 		}
 
 		// The agent loop drains both queues before emitting agent_end. Any messages
 		// here were queued by agent_end extension handlers and need a continuation.
-		return this.agent.hasQueuedMessages();
+		if (this.agent.hasQueuedMessages()) {
+			return true;
+		}
+
+		// Tau patch: the agent has fully settled (no retry, compaction, or queued
+		// work remaining). Emit a terminal event consumers can finalize on.
+		this._emitAgentSettled(msg);
+		return false;
+	}
+
+	private _emitAgentSettled(message: AssistantMessage): void {
+		const outcome =
+			message.stopReason === "error" ? "error" : message.stopReason === "aborted" ? "aborted" : "complete";
+		this._emit({
+			type: "agent_settled",
+			outcome,
+			retried: this._settlementHadRetry,
+			compacted: this._settlementHadCompaction,
+			errorMessage: message.errorMessage,
+		});
+		this._settlementHadRetry = false;
+		this._settlementHadCompaction = false;
 	}
 
 	/**

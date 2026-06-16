@@ -149,6 +149,7 @@ export {
 	isReadToolResult,
 	isToolCallEventType,
 	isWriteToolResult,
+	loadExtensions,
 	wrapRegisteredTool,
 	wrapRegisteredTools,
 } from "./core/extensions/index.ts";
